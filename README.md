@@ -60,6 +60,21 @@ python3 scripts/router_lite.py decide --profile economy --repository .
 
 See [routing profiles](references/routing-profiles.md) for global settings, TOML lane overrides, and precedence. Profiles and the optional prompt hook are adapted from [David Soff's contributions](https://github.com/Davidsoff) in PRs #4 and #6.
 
+### Subagent models
+
+With CC Switch aggregation, name subagents in `.codex/router.toml` so each routed lane runs a model you actually have:
+
+```toml
+schema_version = 1
+
+[subagents.deep_worker]
+model = "ccs-jiong-nas-opencode/deepseek-v4.1-flash"
+effort = "high"
+lanes = ["complex_bounded", "complex_uncertain", "high_consequence"]
+```
+
+Names are free-form, each subagent sets its own `model` and `effort`, the model ID is passed through unchanged, and unclaimed lanes keep the built-in catalog route. Routing still recommends a catalog route; the subagent supplies the model the leaf actually runs.
+
 ## Exit for one project
 
 Tell Codex “stop using this Skill in the current project,” or run:

@@ -1,13 +1,24 @@
 import io
 import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 import test_router_lite as legacy_tests
 LITE = legacy_tests.LITE
 reusable_candidate = legacy_tests.reusable_candidate
 
 
 class CatalogTests(unittest.TestCase):
+    def setUp(self):
+        # Keep the suite hermetic: never read the developer's global router.toml.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        environ = patch.dict(os.environ, {"CODEX_HOME": home.name})
+        environ.start()
+        self.addCleanup(environ.stop)
+
     def args(self, **kwargs):
         return legacy_tests.RouterLiteTests().args(model_policy="current", **kwargs)
 

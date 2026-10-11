@@ -132,3 +132,70 @@ class ProfileTests(unittest.TestCase):
         with patch.dict(os.environ, self.env), redirect_stdout(out):
             LITE.main(["decide", "--repository", str(self.project), "--no-runtime-detection"])
         self.assertEqual(json.loads(out.getvalue())["action"], "disabled")
+
+
+    def test_subagents_define_models_lanes_and_precedence(self):
+        self.write(self.global_file, (
+            'schema_version=1\n'
+            '[subagents.shared]\nmodel="ccs-home/shared"\neffort="low"\nlanes=["mechanical_default"]\n'
+            '[subagents.global_only]\nmodel="ccs-home/global"\neffort="high"\nlanes=["ordinary_default"]\n'
+        ))
+        self.write(self.project_file, (
+            'schema_version=1\n'
+            '[subagents.shared]\nmodel="ccs-project/shared"\neffort="medium"\nlanes=["complex_bounded"]\n'
+        ))
+        config = self.config()
+        self.assertEqual(config["subagents"]["shared"]["model"], "ccs-project/shared")
+        self.assertEqual(config["subagents"]["shared"]["effort"], "medium")
+        self.assertEqual(config["subagent_sources"]["shared"], "project")
+        self.assertEqual(config["subagent_sources"]["global_only"], "global")
+        self.assertEqual(config["lane_subagents"]["complex_bounded"], "shared")
+        self.assertEqual(config["lane_subagents"]["ordinary_default"], "global_only")
+        self.assertNotIn("mechanical_default", config["lane_subagents"])
+
+    def test_subagent_effort_is_validated_against_observed_surface(self):
+        home = Path(self.env["CODEX_HOME"])
+        self.write(home / "config.toml", 'model_catalog_json = "catalog.json"\n')
+        self.write(home / "catalog.json", json.dumps({"models": [
+            {"slug": "ccs/limited", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+            {"slug": "ccs/any"},
+        ]}))
+        self.write(self.project_file, (
+            'schema_version=1\n'
+            '[subagents.worker]\nmodel="ccs/limited"\neffort="low"\nlanes=["mechanical_default"]\n'
+        ))
+        self.assertEqual(self.config()["subagents"]["worker"]["effort"], "low")
+        self.write(self.project_file, (
+            'schema_version=1\n'
+            '[subagents.worker]\nmodel="ccs/any"\neffort="xhigh"\nlanes=["mechanical_default"]\n'
+        ))
+        self.assertEqual(self.config()["subagents"]["worker"]["effort"], "xhigh")
+        self.write(self.project_file, (
+            'schema_version=1\n'
+            '[subagents.worker]\nmodel="ccs/limited"\neffort="xhigh"\nlanes=["mechanical_default"]\n'
+        ))
+        with self.assertRaisesRegex(ValueError, "not supported by observed model"):
+            self.config()
+
+    def test_invalid_subagent_config_is_rejected(self):
+        for body in (
+            'schema_version=1\n[subagents.Worker]\nmodel="m"\neffort="low"\nlanes=["mechanical_default"]\n',
+            'schema_version=1\n[subagents.worker]\nmodel=""\neffort="low"\nlanes=["mechanical_default"]\n',
+            'schema_version=1\n[subagents.worker]\nmodel="m"\neffort="ultra"\nlanes=["mechanical_default"]\n',
+            'schema_version=1\n[subagents.worker]\nmodel="m"\neffort="low"\nlanes=["unknown_lane"]\n',
+            'schema_version=1\n[subagents.worker]\nmodel="m"\neffort="low"\nlanes=[]\n',
+            'schema_version=1\n[subagents.worker]\nmodel="m"\neffort="low"\n',
+            'schema_version=1\n[subagents.worker]\nmodel="m"\neffort="low"\nlanes=["mechanical_default"]\nextra=1\n',
+        ):
+            self.write(self.project_file, body)
+            with self.assertRaises(ValueError):
+                self.config()
+
+    def test_duplicate_lane_claims_are_rejected(self):
+        self.write(self.project_file, (
+            'schema_version=1\n'
+            '[subagents.one]\nmodel="m1"\neffort="low"\nlanes=["mechanical_default"]\n'
+            '[subagents.two]\nmodel="m2"\neffort="low"\nlanes=["mechanical_default"]\n'
+        ))
+        with self.assertRaisesRegex(ValueError, "claimed by subagents"):
+            self.config()

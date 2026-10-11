@@ -60,6 +60,21 @@ python3 scripts/router_lite.py decide --profile economy --repository .
 
 全局设置、TOML 档位覆盖和优先级见[路由配置说明](references/routing-profiles.md)。配置档和可选提示钩子改编自 [David Soff](https://github.com/Davidsoff) 的 PR #4 与 #6。
 
+### 子代理模型
+
+使用 CC Switch 聚合接入时，可在 `.codex/router.toml` 中按名称定义子代理，让每条路由档位运行你实际可用的模型：
+
+```toml
+schema_version = 1
+
+[subagents.deep_worker]
+model = "ccs-jiong-nas-opencode/deepseek-v4.1-flash"
+effort = "high"
+lanes = ["complex_bounded", "complex_uncertain", "high_consequence"]
+```
+
+名称可自由取，不必带 effort 后缀；每个子代理独立配置 `model` 与 `effort`，模型 ID 原样透传，未被认领的档位继续使用内置目录路由。路由仍会给出目录推荐，实际执行模型由子代理决定。
+
 ## 退出当前项目
 
 直接告诉 Codex“当前项目不再使用这个 Skill”，或运行：

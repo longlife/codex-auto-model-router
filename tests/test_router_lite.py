@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -45,6 +46,14 @@ def reusable_candidate(name, model="gpt-5.6-luna", effort="high", **overrides):
 
 
 class RouterLiteTests(unittest.TestCase):
+    def setUp(self):
+        # Keep the suite hermetic: never read the developer's global router.toml.
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        environ = patch.dict(os.environ, {"CODEX_HOME": home.name})
+        environ.start()
+        self.addCleanup(environ.stop)
+
     def args(self, **overrides):
         values = {
             "model_policy": "legacy",  # Preserve the pre-catalog compatibility contract.
@@ -946,6 +955,145 @@ class RouterLiteTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["action"], "local")
         self.assertEqual(payload["warning"], "router-lite-fallback:RouterArgumentError")
+
+    def subagent_config(self, root, text):
+        path = root / ".codex" / "router.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return LITE.profiles.resolve_routing_config(
+            root, None, {"CODEX_HOME": str(root / "home")}
+        )
+
+    def test_configured_subagent_supplies_execution_route_and_spawn_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.subagent_config(root, (
+                'schema_version = 1\n'
+                '[subagents.deep_worker]\n'
+                'model = "ccs-jiong-nas-opencode/deepseek-v4.1-flash"\n'
+                'effort = "high"\n'
+                'lanes = ["mechanical_default"]\n'
+            ))
+            result = LITE._decision(
+                self.args(task_kind="mechanical", routing_config=config), current={}
+            )
+        self.assertEqual(result["action"], "delegate")
+        self.assertEqual(result["subagent"], "deep_worker")
+        self.assertEqual(result["execution_route"], {
+            "model": "ccs-jiong-nas-opencode/deepseek-v4.1-flash", "effort": "high",
+        })
+        self.assertEqual(result["model"], "ccs-jiong-nas-opencode/deepseek-v4.1-flash")
+        self.assertEqual(result["effort"], "high")
+        self.assertEqual(result["agent_route"], {"model": "gpt-6-luna", "effort": "medium"})
+        # No bundled template runs this aggregated model, and agent templates
+        # ignore spawn model overrides, so no agent_type may be sent.
+        self.assertIsNone(result["agent_type"])
+        contract = result["spawn_contract"]
+        self.assertIsNone(contract["agent_type"])
+        self.assertTrue(contract["spawn_without_agent_type"])
+        self.assertEqual(contract["model"], "ccs-jiong-nas-opencode/deepseek-v4.1-flash")
+        self.assertEqual(contract["model_reasoning_effort"], "high")
+        self.assertEqual(contract["model_source"], "project-subagent-config")
+        self.assertEqual(contract["subagent"], "deep_worker")
+
+    def test_configured_catalog_subagent_keeps_matching_agent_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.subagent_config(root, (
+                'schema_version = 1\n'
+                '[subagents.strong_worker]\n'
+                'model = "gpt-6.1-sol"\n'
+                'effort = "medium"\n'
+                'lanes = ["mechanical_default"]\n'
+            ))
+            result = LITE._decision(
+                self.args(task_kind="mechanical", routing_config=config), current={}
+            )
+        self.assertEqual(result["subagent"], "strong_worker")
+        self.assertEqual(
+            result["agent_type"], "codex_auto_model_executor_gpt61_sol_medium"
+        )
+        contract = result["spawn_contract"]
+        self.assertEqual(contract["agent_type"], "codex_auto_model_executor_gpt61_sol_medium")
+        self.assertFalse(contract["spawn_without_agent_type"])
+        self.assertEqual(contract["model"], "gpt-6.1-sol")
+        self.assertEqual(contract["model_reasoning_effort"], "medium")
+
+    def test_unconfigured_lane_keeps_catalog_execution_route(self):
+        config = LITE.profiles.resolve_routing_config(
+            ROOT, None, {"CODEX_HOME": str(ROOT / "no-such-home")}
+        )
+        result = LITE._decision(
+            self.args(task_kind="mechanical", routing_config=config), current={}
+        )
+        self.assertIsNone(result["subagent"])
+        self.assertEqual(result["execution_route"], {"model": "gpt-6-luna", "effort": "medium"})
+        self.assertIsNone(result["spawn_contract"]["subagent"])
+        self.assertEqual(result["spawn_contract"]["model"], "gpt-6-luna")
+        self.assertEqual(result["spawn_contract"]["model_source"], "route-execution")
+        self.assertEqual(
+            result["spawn_contract"]["agent_type"],
+            "codex_auto_model_executor_gpt6_luna_medium",
+        )
+        self.assertFalse(result["spawn_contract"]["spawn_without_agent_type"])
+
+    def test_configured_subagent_reuses_matching_execution_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.subagent_config(root, (
+                'schema_version = 1\n'
+                '[subagents.deep_worker]\n'
+                'model = "ccs-jiong-nas-opencode/deepseek-v4.1-flash"\n'
+                'effort = "high"\n'
+                'lanes = ["ordinary_default"]\n'
+            ))
+            candidate = reusable_candidate(
+                "deep_worker_result",
+                model="ccs-jiong-nas-opencode/deepseek-v4.1-flash",
+                effort="high",
+                repository_realpath=str(root.resolve()),
+            )
+            args = self.args(
+                task_kind="ordinary", risk="low", ambiguity="low", coupling="medium",
+                verification="deterministic", consequence="low", estimated_seconds=60,
+                routing_config=config, repository=root,
+                reuse_candidates_json=json.dumps([candidate]),
+            )
+            with patch.object(
+                LITE.policy, "detect_current_route",
+                return_value={"status": "verified", "thread_id": "t",
+                              "model": "gpt-5.6-sol", "effort": "high"},
+            ):
+                result = self.output(LITE.decide, args)
+        self.assertEqual(result["action"], "reuse")
+        self.assertEqual(result["reuse_target"], "deep_worker_result")
+
+    def test_plan_omits_agent_template_for_aggregated_subagent_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.subagent_config(root, (
+                'schema_version = 1\n'
+                '[subagents.fast_worker]\n'
+                'model = "ccs-jiong-nas-opencode/glm-5.3-flash"\n'
+                'effort = "low"\n'
+                'lanes = ["mechanical_default"]\n'
+            ))
+            args = self.plan_args(
+                [{"task_name": "one", "task_kind": "mechanical", "estimated_seconds": 200}],
+                routing_config=config,
+            )
+            with patch.object(
+                LITE.policy, "detect_current_route",
+                return_value=LITE.policy.unavailable_current(),
+            ):
+                result = self.output(LITE.plan, args)
+        task = result["tasks"][0]
+        self.assertIsNone(task["leaf_agent_type"])
+        self.assertEqual(task["route"]["subagent"], "fast_worker")
+        self.assertEqual(
+            task["route"]["execution_route"]["model"],
+            "ccs-jiong-nas-opencode/glm-5.3-flash",
+        )
 
 
 if __name__ == "__main__":

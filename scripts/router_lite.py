@@ -130,6 +130,14 @@ def select_lite_route(args, task, current):
         explicit_effort=explicit_effort, failed_reasoning=failed_reasoning)
     selected["execution"] = selected["fallback"]["execution"]
     selected["routing_profile"] = config["profile"] if config else "legacy"
+    selected["lane"] = lane
+    subagents = config.get("subagents", {}) if config is not None else {}
+    subagent_name = (
+        config.get("lane_subagents", {}).get(lane) if config is not None else None
+    )
+    selected["subagent"] = (
+        {"name": subagent_name, **subagents[subagent_name]} if subagent_name else None
+    )
     return selected
 
 
@@ -352,9 +360,15 @@ def _decision(args, task=None, current=None):
             else policy.detect_current_route(args.sessions_root)
         )
     selected = select_lite_route(args, task, current)
-    # Routing inputs are normalized by select_lite_route.
+    # Routing inputs are normalized by select_lite_route. The lane decides which
+    # model the router recommends; a configured subagent decides what leaf runs.
     model = selected["execution"]["model"]
     effort = selected["execution"]["effort"]
+    subagent = selected["subagent"]
+    execution = (
+        {"model": subagent["model"], "effort": subagent["effort"]}
+        if subagent is not None else dict(selected["execution"])
+    )
     preferred = dict(selected["recommended"])
     explicit_route = bool(task.get("model", args.model) or task.get("effort", args.effort))
     task_kind = task.get("task_kind", args.task_kind)
@@ -452,9 +466,11 @@ def _decision(args, task=None, current=None):
                 current.get("effort") if current.get("status") == "verified" else None
             )
         else:
-            actual_model = model
-            actual_effort = effort
-    agent_type = None if action != "delegate" else AGENT_TYPES.get((model, effort))
+            actual_model = execution["model"]
+            actual_effort = execution["effort"]
+    agent_type = None if action != "delegate" else AGENT_TYPES.get(
+        (execution["model"], execution["effort"])
+    )
     lifecycle_contract = _lifecycle_contract(args)
     if action == "local":
         if reason == "already-matched":
@@ -479,8 +495,15 @@ def _decision(args, task=None, current=None):
         "effort": actual_effort,
         "agent_type": agent_type,
         "spawn_contract": (
-            None if agent_type is None else {
+            None if action != "delegate" else {
                 "agent_type": agent_type,
+                "spawn_without_agent_type": agent_type is None,
+                "subagent": subagent["name"] if subagent else None,
+                "model": execution["model"],
+                "model_reasoning_effort": execution["effort"],
+                "model_source": (
+                    "project-subagent-config" if subagent else "route-execution"
+                ),
                 "fork_turns": "none",
                 "task_name_pattern": "^[a-z0-9][a-z0-9_]{0,47}$",
                 "validate_task_name_before_spawn": True,
@@ -491,7 +514,9 @@ def _decision(args, task=None, current=None):
             }
         ),
         "recommended_route": {"model": preferred["model"], "effort": preferred["effort"]},
-        "execution_route": selected["execution"],
+        "execution_route": execution,
+        "agent_route": dict(selected["execution"]),
+        "subagent": subagent["name"] if subagent else None,
         "fallback": selected["fallback"],
         "reason": reason,
         "execution_reason": execution_reason,
@@ -688,6 +713,7 @@ def decide(args):
             getattr(args, "reuse_candidates_json", "[]"),
             max_reuses,
             _reuse_identity(args),
+            result["execution_route"]["model"],
         )
         exclusions = _task_reuse_exclusions({}, args)
     else:
@@ -817,7 +843,26 @@ def _task_reuse_exclusions(task, args):
     return exclusions
 
 
-def _reuse_candidates(value, max_reuses, identity):
+def _candidate_model(value, allowed_execution=None):
+    """Accept reviewed routes and configured CC Switch execution models."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("reuse candidate requires a supported route")
+    value = value.strip()
+    catalog_model = catalog.normalize(value)
+    if catalog_model is not None:
+        return catalog_model
+    try:
+        alias_model = policy.normalize_model(value)
+    except ValueError:
+        alias_model = None
+    if alias_model is not None:
+        return alias_model
+    if allowed_execution is not None and value == allowed_execution:
+        return value
+    raise ValueError("reuse candidate requires a supported route")
+
+
+def _reuse_candidates(value, max_reuses, identity, allowed_execution=None):
     try:
         candidates = json.loads(value or "[]")
     except json.JSONDecodeError as exc:
@@ -833,9 +878,9 @@ def _reuse_candidates(value, max_reuses, identity):
             raise ValueError("reuse candidate requires a content-based agent_task_name")
         if name in seen:
             raise ValueError("reuse candidate names must be unique")
-        model = catalog.normalize(item.get("model")) or policy.normalize_model(item.get("model"))
+        model = _candidate_model(item.get("model"), allowed_execution)
         effort = policy.normalize_effort(item.get("effort"))
-        if model not in (*policy.MODELS, *catalog.MODELS) or effort not in EFFORT_RANK:
+        if effort not in EFFORT_RANK:
             raise ValueError("reuse candidate requires a supported route")
         followups_used = item.get("followups_used", 0)
         if not isinstance(followups_used, int) or followups_used < 0:
